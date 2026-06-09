@@ -4,6 +4,14 @@ import { createClient } from '@/lib/supabase/server'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
 
+// Per-user cooldown: max 1 request per 10 seconds (in-memory, per instance)
+// Protects against rapid-fire abuse on top of the monthly plan limits.
+const lastRequestAt = new Map<string, number>()
+const COOLDOWN_MS = 10_000
+
+const MAX_CV_LENGTH = 15_000   // ~10 pages of text
+const MAX_JD_LENGTH = 8_000
+
 export async function POST(request: NextRequest) {
   const supabase = createClient()
 
@@ -14,6 +22,17 @@ export async function POST(request: NextRequest) {
 
   if (authError || !user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  // Per-user cooldown check
+  const now = Date.now()
+  const last = lastRequestAt.get(user.id) ?? 0
+  if (now - last < COOLDOWN_MS) {
+    const retryAfter = Math.ceil((COOLDOWN_MS - (now - last)) / 1000)
+    return NextResponse.json(
+      { error: `Please wait ${retryAfter}s before tailoring again.` },
+      { status: 429, headers: { 'Retry-After': String(retryAfter) } }
+    )
   }
 
   // Fetch user row
@@ -29,8 +48,9 @@ export async function POST(request: NextRequest) {
 
   // Monthly reset check
   const periodStart = new Date(userData.period_start)
-  const now = new Date()
-  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+  const currentMonthStart = new Date(now)
+  currentMonthStart.setDate(1)
+  currentMonthStart.setHours(0, 0, 0, 0)
 
   if (periodStart < currentMonthStart) {
     await supabase
@@ -40,7 +60,7 @@ export async function POST(request: NextRequest) {
     userData.tailors_used = 0
   }
 
-  // Rate-limit check
+  // Monthly plan limit check
   if (userData.tailors_limit !== -1 && userData.tailors_used >= userData.tailors_limit) {
     return NextResponse.json(
       { error: 'Monthly limit reached. Upgrade your plan to continue.' },
@@ -63,6 +83,23 @@ export async function POST(request: NextRequest) {
       { status: 400 }
     )
   }
+
+  // Input length caps — prevent oversized payloads and prompt abuse
+  if (cv.length > MAX_CV_LENGTH) {
+    return NextResponse.json(
+      { error: `CV is too long (max ${MAX_CV_LENGTH.toLocaleString()} characters).` },
+      { status: 400 }
+    )
+  }
+  if (jobDescription.length > MAX_JD_LENGTH) {
+    return NextResponse.json(
+      { error: `Job description is too long (max ${MAX_JD_LENGTH.toLocaleString()} characters).` },
+      { status: 400 }
+    )
+  }
+
+  // Record request time before the (slow) Claude call
+  lastRequestAt.set(user.id, now)
 
   // Call Claude
   const message = await anthropic.messages.create({

@@ -12,9 +12,6 @@ export default function LandingPage() {
       {/* Hero */}
       <section className="flex-1 bg-gradient-to-b from-indigo-50 to-white px-4 py-24 text-center">
         <div className="mx-auto max-w-3xl">
-          <span className="mb-4 inline-block rounded-full bg-indigo-100 px-3 py-1 text-sm font-medium text-indigo-700">
-            Powered by Claude AI
-          </span>
           <h1 className="text-balance text-5xl font-extrabold tracking-tight text-gray-900 sm:text-6xl">
             Tailor your CV to every job.{' '}
             <span className="text-indigo-600">Beat the ATS.</span>

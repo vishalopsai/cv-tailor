@@ -81,22 +81,44 @@ export default function DashboardPage() {
     setError('')
     setTailoredText('')
 
-    const res = await fetch('/api/tailor', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cv, jobDescription }),
-    })
+    try {
+      const res = await fetch('/api/tailor', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cv, jobDescription }),
+      })
 
-    const data = await res.json()
+      // Non-2xx responses come back as JSON errors
+      if (!res.ok) {
+        const data = await res.json()
+        setError(data.error ?? 'Something went wrong. Please try again.')
+        setLoading(false)
+        return
+      }
 
-    if (!res.ok) {
-      setError(data.error ?? 'Something went wrong. Please try again.')
-    } else {
-      setTailoredText(data.tailoredText)
+      // Stream text chunks as they arrive
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let result = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        result += decoder.decode(value, { stream: true })
+        setTailoredText(result)
+      }
+
+      // Flush any remaining bytes
+      result += decoder.decode()
+      setTailoredText(result)
+
+      // Refresh usage counter after stream completes
       fetch('/api/usage')
         .then((r) => r.json())
         .then((u) => setUsage(u))
         .catch(() => null)
+    } catch {
+      setError('Connection error. Please try again.')
     }
 
     setLoading(false)
@@ -285,7 +307,7 @@ export default function DashboardPage() {
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
                   </svg>
-                  Tailoring your CV…
+                  {tailoredText ? 'Writing…' : 'Analysing your CV…'}
                 </span>
               ) : (
                 'Tailor My CV'
@@ -293,14 +315,22 @@ export default function DashboardPage() {
             </button>
           </form>
 
-          {/* Result */}
+          {/* Result — visible as soon as first tokens arrive */}
           {tailoredText && (
             <div className="mt-10">
               <div className="mb-4 flex items-center justify-between">
-                <h2 className="text-xl font-bold text-gray-900">Tailored sections</h2>
+                <div className="flex items-center gap-3">
+                  <h2 className="text-xl font-bold text-gray-900">Tailored sections</h2>
+                  {loading && (
+                    <span className="text-xs font-medium text-indigo-500 animate-pulse">
+                      Writing…
+                    </span>
+                  )}
+                </div>
                 <button
                   onClick={handleDownload}
-                  className="flex items-center gap-2 rounded-lg bg-green-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-green-700 transition-colors"
+                  disabled={loading}
+                  className="flex items-center gap-2 rounded-lg bg-green-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-green-700 disabled:opacity-40 transition-colors"
                 >
                   <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -311,11 +341,14 @@ export default function DashboardPage() {
               <div className="rounded-xl border border-green-200 bg-green-50 p-6">
                 <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-gray-800">
                   {tailoredText}
+                  {loading && <span className="ml-0.5 inline-block w-0.5 h-4 bg-indigo-500 animate-pulse align-middle" />}
                 </pre>
               </div>
-              <p className="mt-3 text-xs text-gray-400">
-                Copy these sections into your full CV before submitting.
-              </p>
+              {!loading && (
+                <p className="mt-3 text-xs text-gray-400">
+                  Copy these sections into your full CV before submitting.
+                </p>
+              )}
             </div>
           )}
         </div>

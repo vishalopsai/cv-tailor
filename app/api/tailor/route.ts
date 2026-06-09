@@ -4,12 +4,11 @@ import { createClient } from '@/lib/supabase/server'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
 
-// Per-user cooldown: max 1 request per 10 seconds (in-memory, per instance)
-// Protects against rapid-fire abuse on top of the monthly plan limits.
+// Per-user cooldown: 1 request per 10 seconds (in-memory, per instance)
 const lastRequestAt = new Map<string, number>()
 const COOLDOWN_MS = 10_000
 
-const MAX_CV_LENGTH = 15_000   // ~10 pages of text
+const MAX_CV_LENGTH = 15_000
 const MAX_JD_LENGTH = 8_000
 
 export async function POST(request: NextRequest) {
@@ -84,7 +83,6 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  // Input length caps — prevent oversized payloads and prompt abuse
   if (cv.length > MAX_CV_LENGTH) {
     return NextResponse.json(
       { error: `CV is too long (max ${MAX_CV_LENGTH.toLocaleString()} characters).` },
@@ -98,13 +96,13 @@ export async function POST(request: NextRequest) {
     )
   }
 
-  // Record request time before the (slow) Claude call
+  // Record request time before the Claude call
   lastRequestAt.set(user.id, now)
 
-  // Call Claude
-  const message = await anthropic.messages.create({
-    model: 'claude-opus-4-8',
-    max_tokens: 4096,
+  // Start streaming response from Claude — Sonnet is fast and high quality for this task
+  const stream = anthropic.messages.stream({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 2048,
     system:
       'You are an expert CV writer and ATS specialist. Rewrite the Personal Summary and Skills sections of this CV to match the job description. Mirror JD keywords naturally. Output plain text only, no markdown.',
     messages: [
@@ -115,21 +113,48 @@ export async function POST(request: NextRequest) {
     ],
   })
 
-  const tailoredText =
-    message.content[0].type === 'text' ? message.content[0].text : ''
+  const encoder = new TextEncoder()
+  const userId = user.id
+  const tailorsUsed = userData.tailors_used
+  const jdSnippet = jobDescription.slice(0, 200)
 
-  // Increment usage counter
-  await supabase
-    .from('users')
-    .update({ tailors_used: userData.tailors_used + 1 })
-    .eq('id', user.id)
+  // Stream text chunks to the client; update DB when complete
+  const readable = new ReadableStream({
+    async start(controller) {
+      try {
+        // Iterate raw stream events and forward text deltas
+        for await (const event of stream) {
+          if (
+            event.type === 'content_block_delta' &&
+            event.delta.type === 'text_delta'
+          ) {
+            controller.enqueue(encoder.encode(event.delta.text))
+          }
+        }
 
-  // Log to tailors table
-  await supabase.from('tailors').insert({
-    user_id: user.id,
-    jd_snippet: jobDescription.slice(0, 200),
-    output_length: tailoredText.length,
+        const finalText = await stream.finalText()
+
+        // Fire-and-forget DB updates after stream completes
+        await Promise.all([
+          supabase
+            .from('users')
+            .update({ tailors_used: tailorsUsed + 1 })
+            .eq('id', userId),
+          supabase.from('tailors').insert({
+            user_id: userId,
+            jd_snippet: jdSnippet,
+            output_length: finalText.length,
+          }),
+        ])
+      } catch (err) {
+        controller.error(err)
+      } finally {
+        controller.close()
+      }
+    },
   })
 
-  return NextResponse.json({ tailoredText })
+  return new Response(readable, {
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+  })
 }
